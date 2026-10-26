@@ -40,7 +40,18 @@ jobs:
 
       - name: Download SDK and dependencies
         working-directory: ./buildscripts
-        run: ./download.sh
+        run: |
+          ok=0
+          for i in 1 2 3; do
+            if ./download.sh; then ok=1; break; fi
+            echo "::warning::download.sh failed (attempt $i), retrying after cleaning deps/"
+            rm -rf deps
+            sleep 20
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::download.sh failed after 3 attempts"
+            exit 1
+          fi
 
       - name: Apply patches
         working-directory: ./buildscripts
