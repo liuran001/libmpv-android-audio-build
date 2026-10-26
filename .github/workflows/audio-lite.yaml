@@ -60,7 +60,7 @@ jobs:
         run: |
           set -u
           . ./include/depinfo.sh
-          NDKBIN="$(echo "$PWD/sdk/android-sdk-linux/ndk/$v_ndk/toolchains/llvm/prebuilt/"*)"
+          NDKBIN="$(echo "$PWD/sdk/android-sdk-linux/ndk/$v_ndk/toolchains/llvm/prebuilt/"*)/bin"
           OUT="$PWD/../out"
           mkdir -p "$OUT/so" "$OUT/evidence" "$OUT/jar"
           : > "$OUT/evidence/alignment.txt"
