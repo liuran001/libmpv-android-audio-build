@@ -1,0 +1,148 @@
+name: audio-lite
+
+# 构建带音频滤镜的 LGPL libmpv.so（Android，四个 ABI），并核验 16 KiB 段对齐。
+# 不使用任何 secrets。产物同时给出 media_kit 可直接消费的 default-<abi>.jar。
+
+on:
+  workflow_dispatch:
+    inputs:
+      archs:
+        description: 'Space separated arches (armv7l arm64 x86 x86_64)'
+        required: false
+        default: 'armv7l arm64 x86 x86_64'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build audio-lite libmpv
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    env:
+      ARCHS: ${{ github.event.inputs.archs }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Symlink SDK
+        working-directory: ./buildscripts
+        run: |
+          mkdir -p sdk
+          ln -s ${ANDROID_HOME} ./sdk/android-sdk-linux
+
+      - name: Download SDK and dependencies
+        working-directory: ./buildscripts
+        run: ./download.sh
+
+      - name: Apply patches
+        working-directory: ./buildscripts
+        run: ./patch.sh
+
+      - name: Build (ffmpeg + mpv, LGPL)
+        working-directory: ./buildscripts
+        run: |
+          set -x
+          for a in ${ARCHS:-armv7l arm64 x86 x86_64}; do
+            ./build.sh --arch "$a"
+          done
+
+      - name: Verify alignment, filters, produce artifacts
+        if: always()
+        working-directory: ./buildscripts
+        run: |
+          set -u
+          . ./include/depinfo.sh
+          NDKBIN="$(echo "$PWD/sdk/android-sdk-linux/ndk/$v_ndk/toolchains/llvm/prebuilt/"*)"
+          OUT="$PWD/../out"
+          mkdir -p "$OUT/so" "$OUT/evidence" "$OUT/jar"
+          : > "$OUT/evidence/alignment.txt"
+          : > "$OUT/evidence/filters.txt"
+
+          declare -A ABIS=( [armv7l]=armeabi-v7a [arm64]=arm64-v8a [x86]=x86 [x86_64]=x86_64 )
+          for a in ${ARCHS:-armv7l arm64 x86 x86_64}; do
+            abi=${ABIS[$a]:-}
+            [ -z "$abi" ] && continue
+            so="prefix/$abi/usr/local/lib/libmpv.so"
+            if [ ! -f "$so" ]; then
+              echo "$a ($abi): MISSING $so" | tee -a "$OUT/evidence/alignment.txt"
+              continue
+            fi
+            cp "$so" "$OUT/so/libmpv-$abi.so"
+            "$NDKBIN/llvm-strip" --strip-all "$OUT/so/libmpv-$abi.so" || true
+            {
+              echo "===== $a ($abi) ====="
+              echo "-- LOAD segments (p_align must be 0x4000 for 16 KiB) --"
+              "$NDKBIN/llvm-readelf" -lW "$OUT/so/libmpv-$abi.so" | grep -E 'LOAD' || true
+              echo "-- machine / arch --"
+              "$NDKBIN/llvm-readelf" -hW "$OUT/so/libmpv-$abi.so" | grep -Ei 'Class|Machine|Type' || true
+            } >> "$OUT/evidence/alignment.txt"
+
+            mkdir -p "$OUT/jar/lib/$abi"
+            cp "$OUT/so/libmpv-$abi.so" "$OUT/jar/lib/$abi/libmpv.so"
+          done
+
+          for cfg in $(find deps/ffmpeg -maxdepth 3 -type f -name config.mak 2>/dev/null); do
+            echo "===== $cfg =====" >> "$OUT/evidence/filters.txt"
+            grep -E '^CONFIG_[A-Z0-9_]+_FILTER=yes' "$cfg" | sort >> "$OUT/evidence/filters.txt" || true
+            grep -E '^CONFIG_(GPL|NONFREE|VERSION3)=' "$cfg" >> "$OUT/evidence/filters.txt" || true
+          done
+
+          ( cd "$OUT/jar" && for abi in armeabi-v7a arm64-v8a x86 x86_64; do
+              [ -d "lib/$abi" ] && zip -qr "default-$abi.jar" "lib/$abi"
+            done; ls -l . )
+
+          ( cd "$OUT" && sha256sum so/*.so jar/*.jar > SHA256SUMS.txt 2>/dev/null; \
+            ls -l so jar >> SHA256SUMS.txt; md5sum jar/*.jar >> SHA256SUMS.txt 2>/dev/null; \
+            cat SHA256SUMS.txt )
+
+          cat "$OUT/evidence/alignment.txt"
+          cat "$OUT/evidence/filters.txt"
+
+      - name: Provenance
+        if: always()
+        working-directory: ./buildscripts
+        run: |
+          set -u
+          . ./include/depinfo.sh
+          OUT="$PWD/../out"
+          {
+            echo "platform: android"
+            echo "build repo: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY @ $GITHUB_SHA"
+            echo "workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "ffmpeg: n$v_ffmpeg ($(git -C deps/ffmpeg rev-parse HEAD 2>/dev/null || echo unknown))"
+            echo "mpv: v$v_mpv ($(git -C deps/mpv rev-parse HEAD 2>/dev/null || echo unknown))"
+            echo "mbedtls: v$v_mbedtls"
+            echo "libxml2: v$v_libxml2"
+            echo "ndk: $v_ndk"
+            echo "license mode: LGPL (ffmpeg --disable-gpl --disable-nonfree --enable-version3; mpv --enable-lgpl)"
+            echo "alignment: LDFLAGS=-Wl,-z,max-page-size=16384"
+            echo
+            echo "--- patches applied (buildscripts/patches) ---"
+            find patches -type f | sort
+            echo
+            echo "--- ffmpeg filter additions (buildscripts/scripts/ffmpeg.sh) ---"
+            sed -n '/--enable-filter=volume/,/--enable-filter=join/p' scripts/ffmpeg.sh
+          } > "$OUT/PROVENANCE.txt"
+          cat "$OUT/PROVENANCE.txt"
+
+      - name: Upload libmpv .so and evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: libmpv-audio-lite-android
+          path: |
+            out/so/*.so
+            out/jar/*.jar
+            out/evidence/*.txt
+            out/SHA256SUMS.txt
+            out/PROVENANCE.txt
+          if-no-files-found: warn
+          retention-days: 30
